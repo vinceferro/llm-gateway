@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "Declared architecture: what each file IS, and which layer it belongs to.",
+    "Layers are ordered top (entry) to bottom (foundation). A dependency may point",
+    "DOWN or sideways; a dependency pointing UP is a layering leak and is drawn as a",
+    "violation. This file is the intent - edit it when the intent changes. The import",
+    "graph is the reality. Compare the two by hand; a delta between them is a bug in one.",
+    "Authored by Claude 2026-08-27, reviewed by a human - correct it freely."
+  ],
+  "name": "llm-gateway",
+  "layers": [
+    {
+      "id": "entry",
+      "title": "Entry",
+      "blurb": "process start-up",
+      "members": ["src/main.ts"]
+    },
+    {
+      "id": "surface",
+      "title": "HTTP surface",
+      "blurb": "accepts requests, streams responses",
+      "members": ["src/server.ts"]
+    },
+    {
+      "id": "decision",
+      "title": "Decision",
+      "blurb": "who is calling, and where does this request go",
+      "members": ["src/router.ts", "src/keys.ts"]
+    },
+    {
+      "id": "adapters",
+      "title": "Upstream adapters",
+      "blurb": "the outside world, and its stand-in",
+      "members": ["src/upstream.ts", "src/mock.ts"]
+    },
+    {
+      "id": "persistence",
+      "title": "Persistence",
+      "blurb": "what survives the request",
+      "members": ["src/ledger.ts", "src/storage.ts"]
+    },
+    {
+      "id": "foundation",
+      "title": "Foundation",
+      "blurb": "shared types and helpers - depended on, depends on nothing",
+      "members": ["src/config.ts", "src/util.ts"]
+    }
+  ],
+  "excluded": {
+    "note": "Tests and tooling are consumers of the system, not layers within it.",
+    "globs": ["test/", "scripts/"]
+  }
+}

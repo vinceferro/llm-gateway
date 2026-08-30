@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# llm-gateway launcher:  gateway <start|stop|status|connect|report>
+#
+# - start/stop/status: systemd user unit when present, foreground otherwise
+# - connect/report: delegated to src/gatewayctl.ts (JSON work needs node)
+#
+# Paths: LLM_GATEWAY_APP_DIR / LLM_GATEWAY_CONFIG override; otherwise the app
+# tree is found relative to this script (follows symlinks), or at
+# ~/.llm-gateway/app; the config at ~/.llm-gateway/llm-gateway.json or
+# ./llm-gateway.json.
+
+set -euo pipefail
+
+# --- pure helpers (sourcable for tests when GATEWAY_LIB=1) -------------------
+
+app_dir_default() {
+  local self="${BASH_SOURCE[0]}"
+  if [[ -L "$self" ]]; then
+    self="$(readlink -f "$self" 2>/dev/null || echo "$self")"
+  fi
+  local script_dir
+  script_dir="$(cd "$(dirname "$self")" && pwd)"
+  if [[ -f "$script_dir/../src/main.ts" ]]; then
+    cd "$script_dir/.." && pwd
+  elif [[ -f "$HOME/.llm-gateway/app/src/main.ts" ]]; then
+    echo "$HOME/.llm-gateway/app"
+  else
+    return 1
+  fi
+}
+
+config_path_default() {
+  if [[ -f "$HOME/.llm-gateway/llm-gateway.json" ]]; then
+    echo "$HOME/.llm-gateway/llm-gateway.json"
+  elif [[ -f "llm-gateway.json" ]]; then
+    echo "$PWD/llm-gateway.json"
+  else
+    return 1
+  fi
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: gateway <command>
+
+  start        start the gateway (systemd user unit if installed, else foreground)
+  stop         stop the gateway
+  status       is it running, and how
+  connect      tool setup: gateway connect <opencode|aider|claude-code> [--write]
+  report       honest savings + work-delivered receipt (reads the ledger; no
+               gateway needed): [--month YYYY-MM] [--project <name>] [--json]
+               [--html <out.html>]
+EOF
+}
+
+# --- resolve environment ------------------------------------------------------
+
+if [[ -n "${GATEWAY_LIB:-}" ]]; then
+  return 0 2>/dev/null || true  # library mode: sourced, nothing else runs
+fi
+
+APP_DIR="${LLM_GATEWAY_APP_DIR:-}" || true
+if [[ -z "$APP_DIR" ]]; then
+  APP_DIR="$(app_dir_default)" || {
+    echo "gateway: cannot locate the llm-gateway app tree." >&2
+    echo "  set LLM_GATEWAY_APP_DIR, or run the installer (install.sh)" >&2
+    exit 1
+  }
+fi
+
+CONFIG="${LLM_GATEWAY_CONFIG:-}" || true
+if [[ -z "$CONFIG" ]]; then
+  CONFIG="$(config_path_default)" || {
+    echo "gateway: no config found (looked at ~/.llm-gateway/llm-gateway.json and ./llm-gateway.json)." >&2
+    echo "  set LLM_GATEWAY_CONFIG or run the installer (install.sh)" >&2
+    exit 1
+  }
+fi
+
+NODE_BIN="$(command -v node)" || { echo "gateway: node not found in PATH" >&2; exit 1; }
+
+# port from config for status probes (best effort; falls back to 8090)
+PORT="${PORT:-$(LG_CONFIG="$CONFIG" "$NODE_BIN" -e 'try{const c=require(process.env.LG_CONFIG);console.log(c.port??8090)}catch{console.log(8090)}' 2>/dev/null || echo 8090)}"
+
+UNIT_NAME="llm-gateway.service"
+UNIT_FILE="$HOME/.config/systemd/user/$UNIT_NAME"
+
+has_systemd_user() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
+probe_status() {
+  # prints an HTTP status code when something answers, "down" otherwise
+  LG_PORT="$PORT" "$NODE_BIN" -e '
+const http = require("node:http");
+const req = http.get(
+  { host: "127.0.0.1", port: Number(process.env.LG_PORT), path: "/v1/models", timeout: 2000 },
+  (r) => { console.log(r.statusCode); process.exit(0); },
+);
+req.on("timeout", () => req.destroy(new Error("timeout")));
+req.on("error", () => { console.log("down"); process.exit(0); });
+setTimeout(() => process.exit(1), 4000);
+' 2>/dev/null || echo "down"
+}
+
+cmd_start() {
+  if [[ -f "$UNIT_FILE" ]] && has_systemd_user; then
+    systemctl --user start "$UNIT_NAME"
+    echo "gateway: started via systemd ($UNIT_NAME)"
+  else
+    echo "gateway: starting in the foreground (ctrl-c to stop) — config: $CONFIG"
+    exec "$NODE_BIN" --disable-warning=ExperimentalWarning --experimental-strip-types "$APP_DIR/src/main.ts" --config "$CONFIG"
+  fi
+}
+
+cmd_stop() {
+  if [[ -f "$UNIT_FILE" ]] && has_systemd_user; then
+    systemctl --user stop "$UNIT_NAME"
+    echo "gateway: stopped ($UNIT_NAME)"
+  else
+    local pids
+    pids="$(pgrep -f "src/main\.ts --config $CONFIG" || true)"
+    if [[ -z "$pids" ]]; then
+      echo "gateway: not running (no systemd unit, no foreground process found)"
+      return 0
+    fi
+    # shellcheck disable=SC2086
+    kill $pids
+    echo "gateway: sent SIGTERM to: $(echo "$pids" | tr '\n' ' ')"
+  fi
+}
+
+cmd_status() {
+  echo "gateway: config  $CONFIG"
+  echo "gateway: port    $PORT"
+  if [[ -f "$UNIT_FILE" ]] && has_systemd_user; then
+    local st
+    st="$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || true)"
+    echo "gateway: systemd $UNIT_NAME: ${st:-unknown}"
+  fi
+  local http
+  http="$(probe_status)"
+  if [[ "$http" == "down" ]]; then
+    echo "gateway: NOT responding on http://127.0.0.1:$PORT"
+    return 1
+  fi
+  echo "gateway: responding on http://127.0.0.1:$PORT (HTTP $http on /v1/models)"
+}
+
+case "${1:-}" in
+  start)
+    shift
+    cmd_start "$@"
+    ;;
+  stop)
+    shift
+    cmd_stop "$@"
+    ;;
+  status)
+    shift
+    cmd_status "$@"
+    ;;
+  connect|report)
+    exec "$NODE_BIN" --disable-warning=ExperimentalWarning --experimental-strip-types "$APP_DIR/src/gatewayctl.ts" --config "$CONFIG" "$@"
+    ;;
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  "")
+    usage
+    exit 2
+    ;;
+  *)
+    echo "gateway: unknown command: $1" >&2
+    usage
+    exit 2
+    ;;
+esac

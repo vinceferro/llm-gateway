@@ -1,0 +1,48 @@
+# GUARANTEES.md — contract ↔ proving-test map
+
+This file maps each behavioral guarantee the gateway makes to the test in this
+repo that proves it. Rules of the artifact:
+
+- Every row names a test that **exists and passes** on the commit that last
+  touched this file. Nothing here is aspirational.
+- A guarantee means exactly what its **Precise statement** says — where that is
+  narrower than intuition, trust the statement.
+- All proofs run **in-process**: the bundled mock provider (`type: "mock"`) or
+  loopback HTTP test doubles. No test in the suite touches a live provider.
+
+## Re-verify
+
+```
+npm test        # full suite — every test cited below is in it
+npm run typecheck
+```
+
+Single file: `node --disable-warning=ExperimentalWarning --experimental-strip-types --test test/<file>.test.ts`
+
+## The guarantees
+
+| Guarantee | Precise statement | Proving test(s) | One-line proof |
+|---|---|---|---|
+| Exactly-once ledger finalize | A request that reaches an upstream 200 writes exactly ONE `usage.jsonl` row on each proven termination path: normal completion (stream and non-stream), client disconnect mid-stream, upstream socket reset mid-stream. Abnormal paths mark the row `incomplete: true`. A request whose entire provider chain fails (502) writes nothing. | `test/finalize.test.ts` (both tests); `test/server.integration.test.ts` › "returns the completion and records a correct ledger row", "delivers chunk-by-chunk SSE ending in [DONE], records stream=true row", "all providers failing yields 502 … nothing recorded" | finalize counts rows after a 250 ms duplicate-settle window on both abnormal paths (`rows.length === 1`, `incomplete === true`, follow-up request 200); integration asserts the success-path row's fields; the 502 path asserts 0 rows |
+| Torn-write tolerance (ledger, read + append) | A torn final line in `usage.jsonl` — crash-truncated partial JSON whose trailing newline was never flushed — is skipped by every reader (summaries, month filters, budget math), AND `appendRecord` never merges a new record into it: the next append lands the new record on its own line, leaving the torn tail in place as a skipped corrupt line. Holds in both orders: torn-after-records and torn-as-only-content. | `test/ledger.test.ts` › "tolerates a missing ledger file and corrupt lines"; "tolerates a TRUNCATED final line (crash mid-append: valid-JSON prefix, no trailing newline)"; "appendRecord never merges a new record onto a torn final line (crash signature: no trailing newline)"; "appendRecord onto a torn-ONLY file still lands the record intact" | a 60-char prefix of a real record is appended with no `\n`; readers report exactly the earlier record; a post-tear `appendRecord` yields 3 raw lines (record / torn-as-corrupt / new record) with both real records counted (requests 2, usd 3); from a torn-ONLY file the appended record counts (requests 1) |
+| SSE pass-through fidelity | Streamed bytes pass through the usage tap unmodified: the client's concatenated bytes equal the upstream's concatenated bytes, delivered incrementally (7 upstream writes 25 ms apart → ≥3 client reads; no buffer-then-flush). Non-streaming bodies are likewise byte-identical. Scope: loopback HTTP test double. | `test/passthrough.test.ts` › "client receives EXACTLY the upstream bytes …", "non-streaming: response body is byte-identical …"; supported by `test/slow-stream.test.ts` (full delivery) and `test/finalize.test.ts` (first byte reaches the client while upstream is still streaming) | `Buffer.compare(Buffer.concat(sent), Buffer.concat(received)) === 0` and `received.length >= 3`; non-stream twin asserts `arrayBuffer` equality incl. unicode and irregular whitespace |
+| Request forwarding (zero mutation, precisely scoped) | The upstream request body is the client's JSON verbatim except (a) `model` rewritten to the provider's `model_id`, (b) `stream_options:{include_usage:true}` injected on streams when absent (suppressed per-provider by `stream_include_usage: false`). Client-specified `include_usage: true` is preserved verbatim. The gateway's own upstream headers are exactly `content-type` and `authorization: Bearer <env key>`; client headers — including routing headers — are never forwarded, and the gateway key never travels upstream. | `test/passthrough.test.ts` › "body is verbatim except model rewrite …", "streaming: stream_options.include_usage is injected …", "streaming: client-specified stream_options.include_usage:true is preserved verbatim …" | a loopback upstream captures the real request: body deep-equals `{…clientBody, model: "upstream-model-1"}` (plus `stream_options` only as above); closed-set header check admits only gateway-owned + known node defaults; `authorization` equals the env-key value and never contains the gateway key |
+| Deadline contract (stream vs non-stream) | For a streaming request the per-attempt deadline (`connect_timeout_ms`) is a time-to-HEADERS window only: once upstream headers arrive the stream is unbounded — a stream whose inter-chunk gap exceeds the connect deadline is delivered in full, the process survives, one ledger row lands. Non-streaming requests use a separate per-attempt window (`nonstream_timeout_ms`, default 120000): slower than the connect deadline but inside the non-stream window → success; slower than that → 502 after retries. | `test/slow-stream.test.ts`; `test/nonstream-timeout.test.ts` (3 tests) | 250 ms deadline vs 350 ms chunk gaps → full stream ends in `[DONE]`, follow-up request 200, streamed row `latency_ms > 1000`; a 700 ms non-stream reply with connect 300 / nonstream 5000 → 200, with nonstream 400 → 502 (3 attempts); the same 700 ms reply as a STREAM with connect 300 → 502 (stream deadline unchanged) |
+| Strict config validation | `loadConfig` rejects invalid/missing fields and chains referencing unknown providers, reports ALL problems in a single error, rejects inline-secret field names with an `api_key_env` hint while never echoing values, and accepts the shipped `config.example.json` unchanged — which is itself scanned to contain no literal-looking key values. | `test/config.test.ts` › "reports ALL validation problems at once", "rejects a missing default chain", Finding 2 (2 tests), Finding 3, "accepts the shipped config.example.json unchanged" | one `ConfigError` names port, base_url, pricing, keys, and unknown-provider issues together; `unknown field "api_key"` gets the `api_key_env` hint and the message is asserted not to contain the secret value |
+| Env-only provider keys | Provider key material is read only from `process.env[api_key_env]` at request time; an unset var makes the provider warn+skip and the chain continues. The config schema has no field that can carry key material: unknown fields are rejected, key-named fields (`api_key`, `token`, `key`, `secret`, …) are rejected with an `api_key_env` hint, and every `api_key_env` VALUE is itself rejected unless it matches a strict env-var NAME shape (`[A-Za-z_][A-Za-z0-9_]*`; lowercase allowed) — so a literal key with non-name characters fails at load. Name-shaped strings unfortunately parse as env-var names; the runtime unset-env warning redacts long values. The offending value is never echoed. | `test/offpeak.test.ts` › "off-peak: unfunded off_peak_chain head is warn+skipped, next provider in THAT chain serves"; `test/config.test.ts` Finding 3; Finding 5 (3 tests); `test/redact.test.ts` (3 tests); `test/passthrough.test.ts` header assertions | a provider whose env var is never exported is skipped and the next provider serves (`x-lg-fallback-used: true`); the upstream saw `authorization: Bearer <env-key-value>` and no header contained the gateway key; `api_key_env: "sk-live-…"` and other non-name shapes throw `ConfigError` naming `api_key_env` + "did you paste a secret?" without echoing the value, while `EXAMPLE_API_KEY`, `my_provider_key`, and `_hidden_fallback_2` all load; >24-char names print as first-8+`…(redacted)` in the unset-env warning, ≤24-char names in full |
+
+## Not yet proven (honest gaps)
+
+1. **Client `stream_options:{include_usage:false}` is overridden to
+   `include_usage: true`.** The injection guard tests truthiness, not
+   presence. Deliberately not pinned by a test (asserting the behavior would
+   cement it); the adjacent guarantees — absent → injected, `true` →
+   preserved, provider opt-out → suppressed — are proven in
+   `test/passthrough.test.ts`.
+2. **SSE inter-chunk timing fidelity is not asserted in-process.** Proven:
+   byte identity, incremental multi-read delivery, full delivery of streams
+   slower than the connect deadline, first byte arriving before the stream
+   ends. Not proven: exact preservation of inter-chunk intervals under load.
+3. **No live-provider proofs.** Every row above is in-process. `bench/` holds
+   live gateway-vs-direct A/B latency results; they are measurements, not
+   proofs, and cover latency only — not byte identity.

@@ -1,0 +1,206 @@
+{
+  "_readme": [
+    "NON-STREAM TIMEOUT: streaming requests use connect_timeout_ms (time to headers). Non-streaming requests send headers+body only at completion, so they get their own window: nonstream_timeout_ms (default 120000). Raise it if you serve long non-stream generations.",
+    "EXAMPLE CONFIG for llm-gateway v0.1 \u2014 copy to llm-gateway.json and edit.",
+    "DEEPSEEK PRICES VERIFIED 2026-08-26 against official docs: off-peak (default outside 01:00-04:00 & 06:00-10:00 UTC weekdays; all weekend) cache-miss rates below; peak = exactly 2x; cache-hit input near-free ($0.007 Flash / $0.022 Pro). Other providers still approximate \u2014 verify before trusting cost numbers.",
+    "PLACEHOLDER PRICING on the 'deepseek-flash' entry \u2014 VERIFY at funding time. The 'deepseek' entry carries VERIFIED (2026-08-28, api-docs.deepseek.com) deepseek-v4-flash off-peak rates: $0.22/M input cache-miss, $0.66/M output; peak is exactly 2x; cache-HIT input is ~$0.007 off-peak (gateway's 2-number pricing model ignores the cache-hit discount, so USD is conservatively OVERestimated when prompts are cached). Peak hours 01:00-04:00 & 06:00-10:00 UTC Mon-Fri; all other hours off-peak.",
+    "OFF-PEAK ROUTING: a routing class may use the object form { chain, off_peak_chain }. At request time the off_peak_chain is used iff some provider IN it declares an off_peak schedule and is off-peak right now (UTC). Off-peak = outside ALL peak_utc windows; weekdays absent from every window's days are ALL-DAY off-peak \u2014 the deepseek schedule lists only Mon-Fri (days 1-5), so Sat/Sun are all-day off-peak. Window bounds are minute-resolution, start inclusive / end exclusive. Pinned provider ids (model == provider id) never consult off-peak logic.",
+    "Provider API keys are NEVER written here. Each provider names an ENV VARIABLE (api_key_env); export it before starting.",
+    "Gateway keys + admin_key may be plaintext (fine for a 0600 local file) or 'sha256:<hex>' hashes via `npm run hash-key -- <secret>`."
+  ],
+  "port": 8090,
+  "host": "127.0.0.1",
+  "storage_dir": "~/.llm-gateway",
+  "admin_key": "lg-admin-dev-only-change-me",
+  "connect_timeout_ms": 10000,
+  "max_retries_per_provider": 2,
+  "retry_backoff_base_ms": 200,
+  "providers": {
+    "deepseek-flash": {
+      "type": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "model_id": "deepseek-chat",
+      "pricing": {
+        "input_per_mtok": 0.22,
+        "output_per_mtok": 0.66
+      },
+      "task_classes": [
+        "bulk"
+      ]
+    },
+    "deepseek-pro": {
+      "type": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "model_id": "deepseek-reasoner",
+      "pricing": {
+        "input_per_mtok": 0.66,
+        "output_per_mtok": 1.98
+      },
+      "task_classes": [
+        "agentic-coding"
+      ]
+    },
+    "deepseek": {
+      "type": "openai",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "model_id": "deepseek-v4-flash",
+      "pricing": {
+        "input_per_mtok": 0.22,
+        "output_per_mtok": 0.66
+      },
+      "task_classes": [
+        "bulk"
+      ],
+      "off_peak": {
+        "peak_utc": [
+          {
+            "days": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "start": "01:00",
+            "end": "04:00"
+          },
+          {
+            "days": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "start": "06:00",
+            "end": "10:00"
+          }
+        ]
+      }
+    },
+    "kimi-code": {
+      "type": "openai",
+      "base_url": "https://api.moonshot.ai/v1",
+      "api_key_env": "MOONSHOT_API_KEY",
+      "model_id": "kimi-k2-0905-preview",
+      "pricing": {
+        "input_per_mtok": 0.6,
+        "output_per_mtok": 2.5
+      },
+      "task_classes": [
+        "agentic-coding"
+      ]
+    },
+    "glm": {
+      "type": "openai",
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "api_key_env": "ZAI_API_KEY",
+      "model_id": "glm-4.6",
+      "pricing": {
+        "input_per_mtok": 0.6,
+        "output_per_mtok": 2.2
+      },
+      "task_classes": [
+        "long-run"
+      ]
+    },
+    "minimax": {
+      "type": "openai",
+      "base_url": "https://api.minimax.io/v1",
+      "api_key_env": "MINIMAX_API_KEY",
+      "model_id": "MiniMax-M2",
+      "pricing": {
+        "input_per_mtok": 0.3,
+        "output_per_mtok": 1.2
+      },
+      "task_classes": [
+        "bulk",
+        "long-run"
+      ]
+    },
+    "ollama-local": {
+      "type": "openai",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model_id": "qwen3:8b",
+      "pricing": {
+        "input_per_mtok": 0,
+        "output_per_mtok": 0
+      },
+      "task_classes": [
+        "autocomplete"
+      ],
+      "stream_include_usage": false
+    },
+    "mock-local": {
+      "type": "mock",
+      "model_id": "mock-model",
+      "pricing": {
+        "input_per_mtok": 0,
+        "output_per_mtok": 0
+      },
+      "task_classes": [
+        "testing"
+      ]
+    }
+  },
+  "routing": {
+    "bulk": {
+      "chain": [
+        "deepseek-flash",
+        "minimax"
+      ],
+      "off_peak_chain": [
+        "deepseek",
+        "ollama-local",
+        "glm"
+      ]
+    },
+    "agentic-coding": [
+      "kimi-code",
+      "deepseek-pro"
+    ],
+    "long-run": [
+      "glm",
+      "minimax"
+    ],
+    "autocomplete": [
+      "ollama-local"
+    ],
+    "testing": [
+      "mock-local"
+    ],
+    "default": [
+      "deepseek-flash"
+    ]
+  },
+  "keys": {
+    "sk-lg-sandbox-dev-key-CHANGE-ME": {
+      "project": "sandbox",
+      "allowed_task_classes": []
+    },
+    "sk-lg-project-alpha-CHANGE-ME": {
+      "project": "project-alpha",
+      "allowed_task_classes": [
+        "agentic-coding",
+        "bulk"
+      ],
+      "sticky_provider_hint": "kimi-code"
+    },
+    "sk-lg-project-beta-CHANGE-ME": {
+      "project": "project-beta",
+      "allowed_task_classes": []
+    }
+  },
+  "budgets": {
+    "project-alpha": {
+      "monthly_usd_cap": 40
+    },
+    "project-beta": {
+      "monthly_usd_cap": 10
+    }
+  },
+  "nonstream_timeout_ms": 120000
+}

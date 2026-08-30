@@ -1,0 +1,23 @@
+node_modules/
+*.local.*
+config.local.json
+.env
+.env.*
+dist/
+coverage/
+data/
+*.log
+.DS_Store
+llm-gateway.json
+# internal workspace rules — harmless if these paths don't exist in your clone
+# kickoff — plugin enablement (holds an absolute core path; do not commit)
+.claude/settings.json
+
+# kickoff machine-local (paths/config; state+memory ARE committed by design)
+.kickoff/instance.env
+.kickoff/adopt-brains-pending
+memory-retrieval/
+# kickoff's adopter-owned charter is TRACKED by design (the *.local.* pattern above
+# exists for config.local.json and must not swallow it)
+!.kickoff/KICKOFF.local.md
+llm-gateway.json.bak*
