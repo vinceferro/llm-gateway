@@ -168,9 +168,10 @@ next to the math.
   No streaming latency numbers exist.
 - The clean-container install timings (bench/install-2026-08-30.md) are **one
   host, one architecture (aarch64), one image digest**, n=3.
-- The **curl-pipe install path is unproven** until the repo is public —
-  validated so far: running `install.sh` from a checkout (which is what the
-  quickstart above does).
+- The **curl-pipe install path was proven on the published artifact**
+  (2026-08-31): `curl -fsSL https://raw.githubusercontent.com/vinceferro/llm-gateway/main/install.sh | bash`
+  in a throwaway `$HOME` — installer fetched, shallow-cloned this repo,
+  bootstrapped config, and the installed app answered `/healthz`.
 - No live-provider proofs in the test suite: every guarantee above is proven
   in-process (mock provider / loopback doubles). See the honest-gaps section
   at the end of [GUARANTEES.md](GUARANTEES.md).

@@ -9,7 +9,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { after, before, describe, it } from "node:test";
-import { appendRecord } from "../src/ledger.ts";
+import { appendRecord, filterRecords, readRecords } from "../src/ledger.ts";
+import { resolveReportPricing } from "../src/prices.ts";
+import { buildReport } from "../src/report.ts";
 import type { RunningServer } from "./helpers.ts";
 import {
   chat,
@@ -617,6 +619,191 @@ describe("GET /admin/usage", () => {
     } finally {
       await s.close();
       cleanupDir(storage);
+    }
+  });
+});
+
+/**
+ * GET /admin/report must be `gateway report --json` over HTTP: the handler
+ * mirrors reportCommand argument-for-argument (same resolveReportPricing,
+ * same filterRecords(readRecords(...)) filter, same buildReport inputs), so
+ * the exactness assertion is a deepEqual against buildReport called DIRECTLY
+ * with identical inputs on the same seeded ledger.
+ */
+describe("GET /admin/report", () => {
+  const M = 1_000_000;
+
+  interface ReportFixture {
+    storage: string;
+    cfg: ReturnType<typeof makeConfig>;
+  }
+
+  /** Mock providers have no base_url → "unknown" host class: rows stay in cf scope (only local/unverified are excluded). */
+  function reportFixture(): ReportFixture {
+    const storage = tmpDir();
+    const cfg = makeConfig({ adminKey: "adm" }, storage);
+    cfg.report = {
+      baseline: { model: "premium-ref", input_per_mtok: 3, output_per_mtok: 9 },
+      prices: { "test-model": { input_per_mtok: 1, output_per_mtok: 2 } },
+    };
+    return { storage, cfg };
+  }
+
+  function seedReportRows(storage: string, month: string): void {
+    const row = (over: Record<string, unknown>): void =>
+      appendRecord(storage, {
+        ts: `${month}-10T10:00:00.000Z`,
+        project: "proj-a",
+        provider: "good",
+        model: "test-model",
+        task_class: "bulk",
+        input_tokens: M,
+        output_tokens: M,
+        usd: 0.9,
+        latency_ms: 500,
+        stream: true,
+        fallback_used: false,
+        attempts: 1,
+        ttfb_ms: 100,
+        stream_ms: 60_000,
+        ...over,
+      });
+    row({ project: "proj-a", provider: "good", model: "test-model" });
+    // unverified price → excluded from counterfactual math with a warning
+    row({ ts: `${month}-11T10:00:00.000Z`, project: "proj-a", model: "mystery-model", usd: 0.1, stream: false });
+    row({ ts: `${month}-12T10:00:00.000Z`, project: "proj-b", usd: 1.5 });
+    // off-month row proves the month filter
+    row({ ts: "2020-01-01T00:00:00.000Z", project: "proj-a", usd: 99 });
+  }
+
+  /** Expected = buildReport called exactly the way the handler must call it. */
+  function expectedReport(
+    { storage, cfg }: ReportFixture,
+    month: string,
+    project?: string,
+  ): ReturnType<typeof buildReport> {
+    return buildReport({
+      month,
+      project,
+      rows: filterRecords(readRecords(storage), { project, month }),
+      providers: cfg.providers,
+      pricing: resolveReportPricing(cfg.report),
+    });
+  }
+
+  it("requires the admin key (401 without / wrong key)", async () => {
+    const storage = tmpDir();
+    const s = await startServer(makeConfig({ adminKey: "adm-123" }, storage), storage);
+    try {
+      const noKey = await fetch(`${s.url}/admin/report?month=2026-08`);
+      assert.equal(noKey.status, 401);
+      const badKey = await fetch(`${s.url}/admin/report?month=2026-08`, {
+        headers: { authorization: "Bearer wrong" },
+      });
+      assert.equal(badKey.status, 401);
+    } finally {
+      await s.close();
+      cleanupDir(storage);
+    }
+  });
+
+  it("is disabled (503) when admin_key is unset", async () => {
+    const storage = tmpDir();
+    const s = await startServer(makeConfig({ adminKey: null }, storage), storage);
+    try {
+      const res = await fetch(`${s.url}/admin/report?month=2026-08`, {
+        headers: { authorization: "Bearer anything" },
+      });
+      assert.equal(res.status, 503);
+    } finally {
+      await s.close();
+      cleanupDir(storage);
+    }
+  });
+
+  it("404s unknown admin paths", async () => {
+    const storage = tmpDir();
+    const s = await startServer(makeConfig({ adminKey: "adm" }, storage), storage);
+    try {
+      const res = await fetch(`${s.url}/admin/whatever`, {
+        headers: { authorization: "Bearer adm" },
+      });
+      assert.equal(res.status, 404);
+    } finally {
+      await s.close();
+      cleanupDir(storage);
+    }
+  });
+
+  it("400s on bad month format", async () => {
+    const fx = reportFixture();
+    seedReportRows(fx.storage, "2026-08");
+    const s = await startServer(fx.cfg, fx.storage);
+    try {
+      for (const bad of ["nope", "2026/08", "202608"]) {
+        const res = await fetch(`${s.url}/admin/report?month=${bad}`, {
+          headers: { authorization: "Bearer adm" },
+        });
+        assert.equal(res.status, 400, `month=${bad}`);
+        const body = (await res.json()) as { error?: { type?: string; message?: string } };
+        assert.equal(body.error?.type, "invalid_request_error");
+        assert.match(body.error?.message ?? "", /month/);
+      }
+    } finally {
+      await s.close();
+      cleanupDir(fx.storage);
+    }
+  });
+
+  it("200 matches buildReport exactly (month-scoped, all projects; month defaults like the CLI)", async () => {
+    const fx = reportFixture();
+    seedReportRows(fx.storage, "2026-08");
+    const s = await startServer(fx.cfg, fx.storage);
+    try {
+      const res = await fetch(`${s.url}/admin/report?month=2026-08`, {
+        headers: { authorization: "Bearer adm" },
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as ReturnType<typeof buildReport>;
+      // shape (explicit, for readable failures) …
+      assert.equal(body.month, "2026-08");
+      assert.equal(body.project, "*");
+      assert.ok(Array.isArray(body.projects));
+      assert.equal(body.projects.length, 2);
+      assert.equal(body.totals.requests, 3);
+      assert.equal(typeof body.counterfactual.total_savings_usd, "number");
+      // … and EXACT equality with the pure engine over identical inputs
+      assert.deepEqual(body, expectedReport(fx, "2026-08"));
+
+      // absent ?month defaults to the current UTC month, same as the CLI
+      const now = new Date().toISOString().slice(0, 7);
+      const resDefault = await fetch(`${s.url}/admin/report`, {
+        headers: { authorization: "Bearer adm" },
+      });
+      assert.equal(resDefault.status, 200);
+      assert.deepEqual(await resDefault.json(), expectedReport(fx, now));
+    } finally {
+      await s.close();
+      cleanupDir(fx.storage);
+    }
+  });
+
+  it("200 matches buildReport exactly (project-scoped)", async () => {
+    const fx = reportFixture();
+    seedReportRows(fx.storage, "2026-08");
+    const s = await startServer(fx.cfg, fx.storage);
+    try {
+      const res = await fetch(`${s.url}/admin/report?month=2026-08&project=proj-a`, {
+        headers: { authorization: "Bearer adm" },
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as ReturnType<typeof buildReport>;
+      assert.equal(body.project, "proj-a");
+      assert.equal(body.totals.requests, 2);
+      assert.deepEqual(body, expectedReport(fx, "2026-08", "proj-a"));
+    } finally {
+      await s.close();
+      cleanupDir(fx.storage);
     }
   });
 });

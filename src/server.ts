@@ -6,6 +6,8 @@
  *                               field may pin a provider id; full SSE pass-through
  *   GET  /v1/models             configured providers as model ids
  *   GET  /admin/usage           ?project=&month=YYYY-MM (admin_key auth)
+ *   GET  /admin/report          ?month=YYYY-MM&project= — same output as
+ *                               `gateway report --json` (admin_key auth)
  *   GET  /healthz
  */
 
@@ -17,10 +19,14 @@ import { bearerFrom, verifySecret } from "./keys.ts";
 import {
   appendRecord,
   computeCost,
+  filterRecords,
   monthSpend,
+  readRecords,
   summarizeLedger,
   type UsageRecord,
 } from "./ledger.ts";
+import { resolveReportPricing } from "./prices.ts";
+import { buildReport } from "./report.ts";
 import { requiresVision, resolveChain, isClassAllowed, budgetExceeded, resolveTaskClass } from "./router.ts";
 import { currentMonth, estTokens, estTokensFromChars, nowIso } from "./util.ts";
 import { loadSticky, saveSticky, type StickyMap } from "./storage.ts";
@@ -470,9 +476,12 @@ export function createGatewayServer(cfg: GatewayConfig, opts: GatewayServerOptio
     if (!presented || !verifySecret(cfg.admin_key, presented)) {
       return sendError(res, 401, "missing or unknown admin key", "authentication_error");
     }
-    if (url.pathname !== "/admin/usage") {
-      return sendError(res, 404, `no admin route: ${url.pathname}`);
-    }
+    if (url.pathname === "/admin/usage") return handleAdminUsage(res, url);
+    if (url.pathname === "/admin/report") return handleAdminReport(res, url);
+    return sendError(res, 404, `no admin route: ${url.pathname}`);
+  }
+
+  function handleAdminUsage(res: http.ServerResponse, url: URL): void {
     const project = url.searchParams.get("project") ?? undefined;
     const month = url.searchParams.get("month") ?? currentMonth();
     if (!/^\d{4}-\d{2}$/.test(month)) {
@@ -480,6 +489,30 @@ export function createGatewayServer(cfg: GatewayConfig, opts: GatewayServerOptio
     }
     const summary = summarizeLedger(storageDir, { project, month });
     sendJson(res, 200, { month, project: project ?? "*", ...summary });
+  }
+
+  /**
+   * `gateway report --json` over HTTP: mirrors reportCommand (src/gatewayctl.ts)
+   * argument-for-argument — same resolveReportPricing, same ledger filter, same
+   * buildReport inputs — so this output is byte-identical to the CLI's for the
+   * same month/project. A PriceError here is unreachable with a loadConfig-
+   * validated config (the semantic pass runs at load); a hand-built config that
+   * bypasses it falls through to handle()'s 500.
+   */
+  function handleAdminReport(res: http.ServerResponse, url: URL): void {
+    const project = url.searchParams.get("project") ?? undefined;
+    const month = url.searchParams.get("month") ?? currentMonth();
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return sendError(res, 400, "month must be YYYY-MM", "invalid_request_error");
+    }
+    const report = buildReport({
+      month,
+      project,
+      rows: filterRecords(readRecords(storageDir), { project, month }),
+      providers: cfg.providers,
+      pricing: resolveReportPricing(cfg.report),
+    });
+    sendJson(res, 200, report);
   }
 
   const server = http.createServer((req, res) => {
