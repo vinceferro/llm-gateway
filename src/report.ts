@@ -57,6 +57,9 @@ export interface ProjectRow {
   cf_b_usd: number | null;
   /** cfB − ledger usd of the SAME cf-scope rows */
   savings_vs_baseline_usd: number | null;
+  /** per-day buckets over THIS project's rows only (same bucketing as
+   *  ReportOutput.daily: UTC day, ascending, absent days absent) */
+  daily: DailyBucket[];
 }
 
 export interface ProviderTtfb {
@@ -180,6 +183,7 @@ function emptyProjectRow(project: string): ProjectRow {
     cf_a_usd: null,
     cf_b_usd: null,
     savings_vs_baseline_usd: null,
+    daily: [],
   };
 }
 
@@ -296,6 +300,9 @@ export function buildReport(input: ReportInput): ReportOutput {
       row.cf_b_usd = cfB;
       row.savings_vs_baseline_usd = round9(cfB - scopeActual);
     }
+    // same helper as the month total (ReportOutput.daily), over this subset —
+    // for totals (all rows) the two are identical by construction
+    row.daily = dailyBuckets(list);
     return row;
   }
 

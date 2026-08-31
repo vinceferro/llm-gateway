@@ -358,6 +358,99 @@ describe("daily buckets", () => {
   });
 });
 
+describe("per-project daily series", () => {
+  it("each ProjectRow.daily buckets THAT project's rows only — own sums, days-with-rows only, ascending", () => {
+    const rows = [
+      // alpha: days 2 (two rows) and 5
+      rec({ project: "alpha", ts: "2026-08-02T12:00:00.000Z", usd: 0.5, input_tokens: 2 * M }),
+      rec({ project: "alpha", ts: "2026-08-02T18:00:00.000Z", usd: 0.125, output_tokens: 3 * M }),
+      rec({ project: "alpha", ts: "2026-08-05T09:00:00.000Z", usd: 0.25 }),
+      // beta: day 2 (overlaps alpha) and day 17 (alpha-free)
+      rec({ project: "beta", ts: "2026-08-02T23:00:00.000Z", usd: 1 }),
+      rec({ project: "beta", ts: "2026-08-17T01:00:00.000Z", usd: 2, input_tokens: 4 * M }),
+    ];
+    const r = buildReport(inputOf(rows));
+    const alpha = r.projects.find((p) => p.project === "alpha")!;
+    const beta = r.projects.find((p) => p.project === "beta")!;
+
+    assert.deepEqual(alpha.daily.map((d) => d.day), [2, 5], "alpha: only days alpha had rows, ascending");
+    assert.deepEqual(beta.daily.map((d) => d.day), [2, 17], "beta: day 2 overlaps alpha but stays beta-only");
+
+    const a2 = alpha.daily[0]!;
+    assert.equal(a2.requests, 2, "both alpha day-2 rows in ONE bucket");
+    assert.equal(a2.input_tokens, 3 * M); // 2M + M
+    assert.equal(a2.output_tokens, 4 * M); // M + 3M
+    approxUsd(a2.usd, 0.625);
+    const a5 = alpha.daily[1]!;
+    assert.equal(a5.requests, 1);
+    assert.equal(a5.input_tokens, M);
+    approxUsd(a5.usd, 0.25);
+
+    // beta day 2 must NOT include alpha's day-2 rows (overlap is per-project)
+    const b2 = beta.daily[0]!;
+    assert.equal(b2.requests, 1);
+    assert.equal(b2.input_tokens, M);
+    approxUsd(b2.usd, 1);
+    const b17 = beta.daily[1]!;
+    assert.equal(b17.requests, 1);
+    assert.equal(b17.input_tokens, 4 * M);
+    approxUsd(b17.usd, 2);
+
+    // totals is a ProjectRow over ALL rows: its series IS the month total
+    assert.deepEqual(r.totals.daily, r.daily);
+  });
+
+  it("project with all rows on one day → single bucket", () => {
+    const rows = [
+      rec({ project: "solo", ts: "2026-08-09T08:00:00.000Z", usd: 0.4 }),
+      rec({ project: "solo", ts: "2026-08-09T20:00:00.000Z", usd: 0.3, input_tokens: 2 * M }),
+    ];
+    const r = buildReport(inputOf(rows));
+    const solo = r.projects[0]!;
+    assert.equal(solo.daily.length, 1, "same-day rows collapse to one bucket");
+    const only = solo.daily[0]!;
+    assert.equal(only.day, 9);
+    assert.equal(only.requests, 2);
+    assert.equal(only.input_tokens, 3 * M);
+    assert.equal(only.output_tokens, 2 * M);
+    approxUsd(only.usd, 0.7);
+  });
+
+  it("a project with no rows cannot appear in projects[]; empty month keeps projects empty", () => {
+    const r = buildReport(inputOf([]));
+    assert.deepEqual(r.projects, []);
+    assert.deepEqual(r.daily, []);
+  });
+
+  it("month-total daily[] is unaffected by the per-project series (same values as before)", () => {
+    const seeded: UsageRecord[] = [
+      rec({ project: "alpha", ts: "2026-08-02T12:00:00.000Z", usd: 0.5, input_tokens: 2 * M, output_tokens: 3 * M }),
+      rec({ project: "beta", ts: "2026-08-02T23:00:00.000Z", usd: 0.125 }),
+      rec({ project: "alpha", ts: "2026-08-31T23:59:59.999Z", usd: 0.25 }),
+      rec({ project: "beta", ts: "2026-08-01T00:30:00.000Z", usd: 0.3 }),
+    ];
+    const r = buildReport(inputOf(seeded, { month: "2026-08" }));
+    assert.deepEqual(
+      r.daily.map((d) => d.day),
+      [1, 2, 31],
+      "month total: union of both projects' days, ascending",
+    );
+    const [d1, d2, d31] = r.daily;
+    // day 1: beta's boundary row only
+    assert.equal(d1!.requests, 1);
+    assert.equal(d1!.input_tokens, M);
+    approxUsd(d1!.usd, 0.3);
+    // day 2: alpha + beta rows aggregate across projects
+    assert.equal(d2!.requests, 2);
+    assert.equal(d2!.input_tokens, 3 * M);
+    assert.equal(d2!.output_tokens, 4 * M);
+    approxUsd(d2!.usd, 0.625);
+    // day 31: alpha only
+    assert.equal(d31!.requests, 1);
+    approxUsd(d31!.usd, 0.25);
+  });
+});
+
 describe("baseline identity surfaces in the report", () => {
   it("carries the resolved baseline (id, rates, source, asOf, verified) for receipts", () => {
     const r = buildReport(inputOf([rec({})]));
