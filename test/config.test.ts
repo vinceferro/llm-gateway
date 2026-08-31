@@ -320,6 +320,74 @@ describe("loadConfig", () => {
     });
   });
 
+  describe("provider capabilities", () => {
+    it("accepts valid capabilities blocks (full, partial, empty, absent)", () => {
+      const dir = tmpDir();
+      try {
+        const p = writeCfg(dir, {
+          ...VALID,
+          providers: {
+            full: { ...VALID.providers.p1, capabilities: { vision: true, tools: true, reasoning: false } },
+            partial: { ...VALID.providers.p1, capabilities: { vision: true } },
+            empty: { ...VALID.providers.p1, capabilities: {} },
+            absent: { ...VALID.providers.p1 }, // no capabilities key at all
+          },
+          routing: { default: ["full"] },
+        });
+        const cfg = loadConfig(p);
+        assert.deepEqual(cfg.providers["full"]!.capabilities, { vision: true, tools: true, reasoning: false });
+        assert.deepEqual(cfg.providers["partial"]!.capabilities, { vision: true });
+        assert.deepEqual(cfg.providers["empty"]!.capabilities, {});
+        assert.equal(cfg.providers["absent"]!.capabilities, undefined);
+      } finally {
+        cleanupDir(dir);
+      }
+    });
+
+    it("rejects mistyped capability values (vision: \"yes\") with the strict error style", () => {
+      const dir = tmpDir();
+      try {
+        const p = writeCfg(dir, {
+          ...VALID,
+          providers: {
+            p1: { ...VALID.providers.p1, capabilities: { vision: "yes" } },
+          },
+        });
+        let err: unknown;
+        try {
+          loadConfig(p);
+          throw new Error("expected ConfigError, got successful load");
+        } catch (e) {
+          err = e;
+        }
+        assert.ok(err instanceof ConfigError);
+        const msg = (err as Error).message;
+        assert.match(msg, /providers\.p1\.capabilities\.vision: expected boolean/);
+        assert.match(msg, /"yes"/);
+      } finally {
+        cleanupDir(dir);
+      }
+    });
+
+    it("rejects unknown capability fields and a non-object capabilities block", () => {
+      const dir = tmpDir();
+      try {
+        const bad1 = writeCfg(dir, {
+          ...VALID,
+          providers: { p1: { ...VALID.providers.p1, capabilities: { vision: true, omnipotent: true } } },
+        });
+        assert.throws(() => loadConfig(bad1), /capabilities: unknown field "omnipotent"/);
+        const bad2 = writeCfg(dir, {
+          ...VALID,
+          providers: { p1: { ...VALID.providers.p1, capabilities: "vision-capable" } },
+        });
+        assert.throws(() => loadConfig(bad2), /capabilities: expected object/);
+      } finally {
+        cleanupDir(dir);
+      }
+    });
+  });
+
   describe("Finding 4: config file perms warning actually exists", () => {
     it("warns when group/other bits are set, stays quiet at 0600", () => {
       const dir = tmpDir();

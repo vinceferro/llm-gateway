@@ -6,6 +6,7 @@
     "PLACEHOLDER PRICING on the 'deepseek-flash' entry \u2014 VERIFY at funding time. The 'deepseek' entry carries VERIFIED (2026-08-28, api-docs.deepseek.com) deepseek-v4-flash off-peak rates: $0.22/M input cache-miss, $0.66/M output; peak is exactly 2x; cache-HIT input is ~$0.007 off-peak (gateway's 2-number pricing model ignores the cache-hit discount, so USD is conservatively OVERestimated when prompts are cached). Peak hours 01:00-04:00 & 06:00-10:00 UTC Mon-Fri; all other hours off-peak.",
     "OFF-PEAK ROUTING: a routing class may use the object form { chain, off_peak_chain }. At request time the off_peak_chain is used iff some provider IN it declares an off_peak schedule and is off-peak right now (UTC). Off-peak = outside ALL peak_utc windows; weekdays absent from every window's days are ALL-DAY off-peak \u2014 the deepseek schedule lists only Mon-Fri (days 1-5), so Sat/Sun are all-day off-peak. Window bounds are minute-resolution, start inclusive / end exclusive. Pinned provider ids (model == provider id) never consult off-peak logic.",
     "Provider API keys are NEVER written here. Each provider names an ENV VARIABLE (api_key_env); export it before starting.",
+    "CAPABILITIES: a provider may declare an optional capabilities block { vision, tools, reasoning } (booleans; see the glm entry). Unspecified = capability NOT claimed \u2014 never overclaim: /v1/models advertises claimed capabilities with false for unclaimed, and requests carrying image parts (image_url) route only to providers that claim vision, failing with HTTP 422 when a task class has none.",
     "Gateway keys + admin_key may be plaintext (fine for a 0600 local file) or 'sha256:<hex>' hashes via `npm run hash-key -- <secret>`."
   ],
   "port": 8090,
@@ -105,7 +106,10 @@
       },
       "task_classes": [
         "long-run"
-      ]
+      ],
+      "capabilities": {
+        "vision": true
+      }
     },
     "minimax": {
       "type": "openai",

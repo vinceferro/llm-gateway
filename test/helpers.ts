@@ -39,6 +39,8 @@ export interface TestConfigOptions {
   connect_timeout_ms?: number;
   /** per-attempt time-to-headers/body window for NON-streaming requests (default 120000 in production) */
   nonstream_timeout_ms?: number;
+  /** Extra provider entries (or overrides of the default three mocks) — e.g. to declare capabilities. */
+  providers?: Record<string, ProviderConfig>;
 }
 
 export const TEST_KEY = "sk-test-key-1";
@@ -60,6 +62,7 @@ export function makeConfig(opts: TestConfigOptions = {}, dir: string): GatewayCo
       flaky: mockProvider("flaky"),
       good: mockProvider("good"),
       alt: mockProvider("alt"),
+      ...(opts.providers ?? {}),
     },
     keys: { [TEST_KEY]: key },
     routing: opts.routing ?? { bulk: ["flaky", "good"], default: ["good"] },

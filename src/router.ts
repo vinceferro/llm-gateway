@@ -16,7 +16,7 @@
  *   deterministic tests; production callers default to the real clock.
  */
 
-import type { GatewayConfig, OffPeakSchedule, RoutingChain } from "./config.ts";
+import { providerCapabilities, type GatewayConfig, type OffPeakSchedule, type RoutingChain } from "./config.ts";
 import type { StickyMap } from "./storage.ts";
 
 const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -67,6 +67,11 @@ export interface RouteDecision {
   stickyApplied: boolean;
   /** true when the off_peak_chain resolved the chain (surfaced on the [lg] request line) */
   offPeakApplied: boolean;
+  /**
+   * Set (and chain empty) when a capability requirement filtered the chain
+   * down to nothing — server surfaces it as HTTP 422. Never silently downgraded.
+   */
+  capabilityError?: string;
 }
 
 /** Only the key fields routing actually reads — keeps these functions decoupled from full KeyConfig. */
@@ -76,20 +81,50 @@ export interface RoutingKeyInfo {
 }
 
 /**
+ * True when the request carries image content: any message whose `content` is
+ * an array containing a part with `type === "image_url"`. Deliberately NARROW:
+ * only image_url gates routing this round (input_audio and other part types
+ * do not). String content and unknown part types never trigger the gate.
+ */
+export function requiresVision(body: unknown): boolean {
+  if (typeof body !== "object" || body === null) return false;
+  const msgs = (body as { messages?: unknown }).messages;
+  if (!Array.isArray(msgs)) return false;
+  for (const m of msgs) {
+    if (typeof m !== "object" || m === null) continue;
+    const content = (m as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (typeof part === "object" && part !== null && (part as { type?: unknown }).type === "image_url") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Build the attempt order for one request.
  * - model naming a configured provider → pinned single-provider chain (never
  *   consults off-peak logic)
  * - otherwise cfg.routing[taskClass]; for object-form entries the
  *   off_peak_chain replaces the chain when the pinned off-peak rule fires
+ * - when opts.requiresVision, providers that do not CLAIM vision (see
+ *   providerCapabilities) are skipped IN ORDER — a capability failure, not
+ *   load-balancing; the configured order survives. Empty after filtering →
+ *   explicit capabilityError (422 upstream), never a silent downgrade.
+ *   Requests WITHOUT image parts are never filtered (empty capabilities
+ *   change nothing for text).
  * - sticky state (observed last-good, else key hint) is promoted to head if
- *   present in the RESOLVED chain
+ *   present in the RESOLVED chain — vision filtering runs BEFORE sticky
+ *   reorder, so a text-only sticky provider is skipped for image requests
  */
 export function resolveChain(
   cfg: Pick<GatewayConfig, "providers" | "routing">,
   sticky: StickyMap,
   keyId: string,
   keyCfg: RoutingKeyInfo | undefined,
-  opts: { taskClass: string; model?: unknown; now?: Date },
+  opts: { taskClass: string; model?: unknown; now?: Date; requiresVision?: boolean },
 ): RouteDecision {
   const model = typeof opts.model === "string" ? opts.model : undefined;
 
@@ -115,6 +150,23 @@ export function resolveChain(
         base = [...offPeakChain];
         offPeakApplied = true;
       }
+    }
+  }
+
+  // Capability gate BEFORE sticky reorder: an image request skips providers
+  // that do not claim vision, keeping the configured order (capability
+  // failure ≠ load-balancing). Text requests never enter this branch, so
+  // chains with no declared capabilities are untouched.
+  if (opts.requiresVision) {
+    base = base.filter((pid) => providerCapabilities(cfg.providers[pid]).vision);
+    if (base.length === 0) {
+      return {
+        chain: [],
+        pinnedProvider,
+        stickyApplied: false,
+        offPeakApplied,
+        capabilityError: `no vision-capable provider in chain for task class "${opts.taskClass}"`,
+      };
     }
   }
 

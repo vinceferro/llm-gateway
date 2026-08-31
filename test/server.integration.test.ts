@@ -15,6 +15,7 @@ import {
   chat,
   cleanupDir,
   makeConfig,
+  mockProvider,
   readJsonl,
   startServer,
   TEST_KEY,
@@ -75,6 +76,32 @@ describe("GET /v1/models", () => {
       assert.equal(body.object, "list");
       const ids = body.data.map((m) => m.id).sort();
       assert.deepEqual(ids, ["alt", "flaky", "good"]);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("advertises resolved capabilities (false when unclaimed; existing fields untouched)", async () => {
+    const s = await startServer(
+      makeConfig({ providers: { good: mockProvider("good", { capabilities: { vision: true } }) } }, dir),
+      dir,
+    );
+    try {
+      const res = await fetch(`${s.url}/v1/models`, {
+        headers: { authorization: `Bearer ${TEST_KEY}` },
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as {
+        data: Array<{ id: string; capabilities: Record<string, boolean>; task_classes?: unknown; pricing?: unknown }>;
+      };
+      const byId = Object.fromEntries(body.data.map((m) => [m.id, m.capabilities]));
+      assert.deepEqual(byId.good, { vision: true, tools: false, reasoning: false });
+      assert.deepEqual(byId.flaky, { vision: false, tools: false, reasoning: false });
+      assert.deepEqual(byId.alt, { vision: false, tools: false, reasoning: false });
+      // task_classes/pricing/owned_by survive unchanged
+      const good = body.data.find((m) => m.id === "good")!;
+      assert.deepEqual(good.task_classes, []);
+      assert.deepEqual(good.pricing, { input_per_mtok: 0.5, output_per_mtok: 2 });
     } finally {
       await s.close();
     }
@@ -336,6 +363,64 @@ describe("fallback chain", () => {
       assert.equal(r.headers["x-lg-provider"], "good");
       const row = readJsonl(`${storage}/usage.jsonl`).at(-1)!;
       assert.equal(row.fallback_used, true);
+    } finally {
+      await s.close();
+      cleanupDir(storage);
+    }
+  });
+});
+
+describe("capability-gated routing (vision)", () => {
+  const IMG_MSGS = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "what is in this image?" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+      ],
+    },
+  ];
+
+  it("serves image requests only from vision-claimed providers — text-only sticky head skipped in order; text requests unchanged", async () => {
+    const storage = tmpDir();
+    const cfg = makeConfig(
+      {
+        routing: { vision: ["flaky", "good"], default: ["good"] },
+        providers: { good: mockProvider("good", { capabilities: { vision: true } }) },
+      },
+      storage,
+    );
+    const s = await startServer(cfg, storage);
+    try {
+      // 1. text request: routes to the chain head (flaky, claims nothing) exactly as before → sticky=flaky
+      const r1 = await chat(s.port, TEST_KEY, { model: "x", messages: [{ role: "user", content: "plain text" }] }, { "x-task-class": "vision" });
+      assert.equal(r1.status, 200);
+      assert.equal(r1.headers["x-lg-provider"], "flaky");
+
+      // 2. image request: flaky claims no vision → skipped IN ORDER; good (vision) serves
+      const r2 = await chat(s.port, TEST_KEY, { model: "x", messages: IMG_MSGS }, { "x-task-class": "vision" });
+      assert.equal(r2.status, 200);
+      assert.equal(r2.headers["x-lg-provider"], "good");
+    } finally {
+      await s.close();
+      cleanupDir(storage);
+    }
+  });
+
+  it("rejects image requests with 422 naming class + capability when no provider in the class claims vision", async () => {
+    const storage = tmpDir();
+    const s = await startServer(
+      makeConfig({ routing: { autocomplete: ["flaky"], default: ["good"] } }, storage),
+      storage,
+    );
+    try {
+      const r = await chat(s.port, TEST_KEY, { model: "x", messages: IMG_MSGS }, { "x-task-class": "autocomplete" });
+      assert.equal(r.status, 422);
+      const body = r.json as { error?: { message?: string; type?: string } };
+      assert.match(body.error?.message ?? "", /no vision-capable provider in chain for task class "autocomplete"/);
+      assert.equal(body.error?.type, "capability_error");
+      // gated BEFORE dispatch: no upstream attempt, nothing recorded
+      assert.equal(readJsonl(`${storage}/usage.jsonl`).length, 0);
     } finally {
       await s.close();
       cleanupDir(storage);

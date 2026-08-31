@@ -41,6 +41,24 @@ export interface OffPeakSchedule {
   peak_utc: PeakWindow[];
 }
 
+/**
+ * Declared provider capabilities — all optional. ABSENT = claims nothing
+ * (never overclaim): /v1/models advertises the resolved set with false for
+ * unclaimed, and vision-gated routing consults only `vision`.
+ */
+export interface ProviderCapabilities {
+  vision?: boolean;
+  tools?: boolean;
+  reasoning?: boolean;
+}
+
+/** Resolved capability set — the one source of truth shared by router + /v1/models. */
+export interface ResolvedCapabilities {
+  vision: boolean;
+  tools: boolean;
+  reasoning: boolean;
+}
+
 export interface ProviderConfig {
   /** "openai" (default) = OpenAI-compatible HTTP upstream; "mock" = in-process fake. */
   type?: "openai" | "mock";
@@ -54,6 +72,23 @@ export interface ProviderConfig {
   stream_include_usage?: boolean;
   /** Optional peak-window schedule enabling off-peak chain selection for classes that name this provider in an off_peak_chain. */
   off_peak?: OffPeakSchedule;
+  /** Capabilities this provider is CLAIMED to have; absent/empty claims nothing. See providerCapabilities(). */
+  capabilities?: ProviderCapabilities;
+}
+
+/**
+ * The resolved capability set for one provider entry: true only when the
+ * config explicitly claims it. Absent capabilities (or absent provider —
+ * defensive) resolve to all-false. Used by vision-gated routing AND the
+ * /v1/models advertisement, so they can never disagree.
+ */
+export function providerCapabilities(p?: ProviderConfig): ResolvedCapabilities {
+  const c = p?.capabilities;
+  return {
+    vision: c?.vision === true,
+    tools: c?.tools === true,
+    reasoning: c?.reasoning === true,
+  };
 }
 
 /**
@@ -232,7 +267,29 @@ const KNOWN_PROVIDER_FIELDS: ReadonlySet<string> = new Set([
   "task_classes",
   "stream_include_usage",
   "off_peak",
+  "capabilities",
 ]);
+
+/** The only fields allowed inside a provider's capabilities block. */
+const KNOWN_CAPABILITY_FIELDS: ReadonlySet<string> = new Set(["vision", "tools", "reasoning"]);
+
+/** Strict capabilities validation; issues reported via bad() in the uniform style (field NAMES echoed, never secrets — none here are). */
+function validateCapabilities(v: unknown, bad: (msg: string) => void): void {
+  if (!isPlainObject(v)) {
+    bad(`capabilities: expected object { vision?, tools?, reasoning? } (all optional booleans)`);
+    return;
+  }
+  for (const f of Object.keys(v)) {
+    if (!KNOWN_CAPABILITY_FIELDS.has(f)) {
+      bad(`capabilities: unknown field "${f}" (only vision, tools, reasoning are supported)`);
+      continue;
+    }
+    const val = (v as Record<string, unknown>)[f];
+    if (typeof val !== "boolean") {
+      bad(`capabilities.${f}: expected boolean, got ${JSON.stringify(val)}`);
+    }
+  }
+}
 
 /** Fields that look like someone tried to inline a provider secret. */
 const KEY_FIELD_HINTS: Readonly<Record<string, string>> = {
@@ -378,6 +435,7 @@ export function loadConfig(path: string): GatewayConfig {
         bad(`stream_include_usage: expected boolean`);
       }
       if (p.off_peak !== undefined) validateOffPeak(p.off_peak, bad);
+      if (p.capabilities !== undefined) validateCapabilities(p.capabilities, bad);
 
       if (pIssues.length > 0) {
         issues.push(...pIssues);

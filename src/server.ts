@@ -12,6 +12,7 @@
 import http from "node:http";
 import { Readable } from "node:stream";
 import type { GatewayConfig } from "./config.ts";
+import { providerCapabilities } from "./config.ts";
 import { bearerFrom, verifySecret } from "./keys.ts";
 import {
   appendRecord,
@@ -20,7 +21,7 @@ import {
   summarizeLedger,
   type UsageRecord,
 } from "./ledger.ts";
-import { resolveChain, isClassAllowed, budgetExceeded, resolveTaskClass } from "./router.ts";
+import { requiresVision, resolveChain, isClassAllowed, budgetExceeded, resolveTaskClass } from "./router.ts";
 import { currentMonth, estTokens, estTokensFromChars, nowIso } from "./util.ts";
 import { loadSticky, saveSticky, type StickyMap } from "./storage.ts";
 import { executeWithFailover, UpstreamError, ClientAbortedError } from "./upstream.ts";
@@ -206,6 +207,8 @@ export function createGatewayServer(cfg: GatewayConfig, opts: GatewayServerOptio
           owned_by: id,
           task_classes: p.task_classes,
           pricing: p.pricing,
+          // resolved claim set — false when the config doesn't claim it (shared source of truth with routing: providerCapabilities)
+          capabilities: providerCapabilities(p),
         })),
       });
       return;
@@ -270,7 +273,12 @@ export function createGatewayServer(cfg: GatewayConfig, opts: GatewayServerOptio
       taskClass: tc.taskClass,
       model: body.model,
       now: opts.now?.(),
+      requiresVision: requiresVision(body),
     });
+    // capability gate fired before any dispatch: explicit 422, never a silent downgrade
+    if (decision.capabilityError) {
+      return sendError(res, 422, decision.capabilityError, "capability_error");
+    }
     if (decision.chain.length === 0) {
       return sendError(res, 502, `empty routing chain for task class "${tc.taskClass}"`, "config_error");
     }
