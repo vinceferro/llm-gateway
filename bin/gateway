@@ -115,6 +115,12 @@ cmd_start() {
 
 cmd_stop() {
   if [[ -f "$UNIT_FILE" ]] && has_systemd_user; then
+    # ops traceability: record WHO stopped the gateway (stray stops observed
+    # 2026-08-31 — clean SIGTERMs with no attribution in the journal)
+    {
+      printf '%s caller=%s tty=%s ppid_cmd=%s\n' "$(date -Is)" "$(whoami)" \
+        "$(tty || echo no-tty)" "$(ps -o args= -p $PPID 2>/dev/null | head -c 120)"
+    } >> "$HOME/.llm-gateway/stop-audit.log" 2>/dev/null || true
     systemctl --user stop "$UNIT_NAME"
     echo "gateway: stopped ($UNIT_NAME)"
   else
