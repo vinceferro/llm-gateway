@@ -192,7 +192,7 @@ export function createGatewayServer(cfg: GatewayConfig, opts: GatewayServerOptio
     const path = url.pathname;
 
     if (path === "/healthz" && req.method === "GET") {
-      sendJson(res, 200, { ok: true, version: "0.1.0" });
+      sendJson(res, 200, { ok: true, version: "0.2.0" });
       return;
     }
 

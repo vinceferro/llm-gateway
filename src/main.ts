@@ -37,7 +37,7 @@ function main(): void {
 
   const server = createGatewayServer(cfg);
   server.listen(cfg.port, cfg.host, () => {
-    console.log(`[lg] llm-gateway v0.1.0 listening on http://${cfg.host}:${cfg.port}`);
+    console.log(`[lg] llm-gateway v0.2.0 listening on http://${cfg.host}:${cfg.port}`);
     console.log(`[lg] providers: ${Object.keys(cfg.providers).join(", ")}`);
     console.log(`[lg] storage:   ${cfg.storage_dir}`);
     console.log(`[lg] config:    ${usedPath}`);
