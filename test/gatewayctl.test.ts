@@ -9,18 +9,21 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, appendFileSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   CliError,
   applyOpencodeMerge,
   connectInstructions,
+  findKeyForProject,
   mergeOpencodeConfig,
   opencodeProviderBlock,
   opencodeConfigPath,
+  parseConnectFlags,
   runCli,
 } from "../src/gatewayctl.ts";
 import { buildBootstrapConfig } from "../src/bootstrap.ts";
+import { loadConfig } from "../src/config.ts";
 import { cleanupDir, tmpDir } from "./helpers.ts";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
@@ -553,6 +556,227 @@ describe("gateway report (replaces the admin-endpoint stub)", () => {
       );
     } finally {
       cleanupDir(fx.dir);
+    }
+  });
+});
+
+/**
+ * `gateway connect --project [name]` — mint-or-select a per-repo gateway key.
+ * Two keys in the fixture (insertion order matters: legacy selection takes the
+ * FIRST key, so the legacy guard below proves --project actually re-selects).
+ */
+describe("gateway connect --project (mint-or-select per-repo key)", () => {
+  const node = process.execPath;
+  const script = join(REPO_ROOT, "src", "gatewayctl.ts");
+  const baseArgs = ["--disable-warning=ExperimentalWarning", "--experimental-strip-types", script];
+  const SKLG = /^sk-lg-[0-9a-f]{64}$/;
+
+  /** Two-key config on disk, 0600, written the way bootstrap writes configs. */
+  function connectFixture(dir: string): { cfgPath: string; keyGeneric: string; keyAlpha: string } {
+    const keyGeneric = "sk-lg-" + "cd".repeat(32);
+    const keyAlpha = "sk-lg-" + "ef".repeat(32);
+    const cfgPath = join(dir, "llm-gateway.json");
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        port: 8090,
+        host: "127.0.0.1",
+        storage_dir: join(dir, "storage"),
+        providers: {
+          ds: {
+            type: "openai",
+            base_url: "https://api.example.com/v1",
+            model_id: "test-model",
+            pricing: { input_per_mtok: 0.5, output_per_mtok: 2 },
+            task_classes: ["bulk"],
+          },
+        },
+        keys: { [keyGeneric]: { project: "generic" }, [keyAlpha]: { project: "alpha" } },
+        routing: { default: ["ds"] },
+        budgets: {},
+      }) + "\n",
+      { encoding: "utf8", mode: 0o600 },
+    );
+    return { cfgPath, keyGeneric, keyAlpha };
+  }
+
+  function runConnect(args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): string {
+    return execFileSync(node, [...baseArgs, ...args], {
+      encoding: "utf8",
+      timeout: 30_000,
+      cwd: opts.cwd,
+      env: opts.env,
+    });
+  }
+
+  it("parseConnectFlags: legacy tool detection untouched (first bare arg wins, wherever it sits)", () => {
+    assert.deepEqual(parseConnectFlags(["opencode", "--write"]), {
+      tool: "opencode",
+      write: true,
+      projectRequested: false,
+    });
+    assert.deepEqual(parseConnectFlags(["--write", "aider"]), {
+      tool: "aider",
+      write: true,
+      projectRequested: false,
+    });
+    assert.deepEqual(parseConnectFlags(["opencode"]), {
+      tool: "opencode",
+      write: false,
+      projectRequested: false,
+    });
+  });
+
+  it("parseConnectFlags: --project takes an optional value; a following flag is not the value", () => {
+    assert.deepEqual(parseConnectFlags(["opencode", "--project", "my-repo"]), {
+      tool: "opencode",
+      write: false,
+      projectRequested: true,
+      projectValue: "my-repo",
+    });
+    assert.deepEqual(parseConnectFlags(["opencode", "--project"]), {
+      tool: "opencode",
+      write: false,
+      projectRequested: true,
+    });
+    assert.deepEqual(parseConnectFlags(["opencode", "--project", "--write"]), {
+      tool: "opencode",
+      write: true,
+      projectRequested: true,
+    });
+    // the --project value must never be mistaken for the tool name
+    assert.deepEqual(parseConnectFlags(["--project", "my-repo", "opencode"]), {
+      tool: "opencode",
+      write: false,
+      projectRequested: true,
+      projectValue: "my-repo",
+    });
+  });
+
+  it("findKeyForProject matches case-sensitively on exact project name, first in insertion order", () => {
+    const dir = tmpDir();
+    try {
+      const { cfgPath, keyAlpha } = connectFixture(dir);
+      const cfg = loadConfig(cfgPath);
+      assert.equal(findKeyForProject(cfg, "alpha"), keyAlpha);
+      assert.equal(findKeyForProject(cfg, "Alpha"), null);
+      assert.equal(findKeyForProject(cfg, "nope"), null);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it("--project mints a sk-lg- key when none matches; config stays schema-valid and fields survive", () => {
+    const dir = tmpDir();
+    try {
+      const { cfgPath, keyGeneric, keyAlpha } = connectFixture(dir);
+      const stdout = runConnect(["--config", cfgPath, "connect", "opencode", "--project", "fresh-proj"]);
+      assert.match(stdout, /minted/i, "output says a key was minted");
+      // the minted key is a fresh 256-bit sk-lg- key, distinct from both fixtures
+      // (it legitimately appears twice: mint notice + provider block)
+      const printed = [...new Set([...stdout.matchAll(/sk-lg-[0-9a-f]{64}/g)].map((m) => m[0]))];
+      const fresh = printed.filter((k) => k !== keyGeneric && k !== keyAlpha);
+      assert.equal(fresh.length, 1, `exactly one new key printed, got ${JSON.stringify(fresh)}`);
+      assert.match(fresh[0]!, SKLG);
+
+      // config on disk re-validates with the strict loader and carries the label
+      const cfg = loadConfig(cfgPath);
+      const newKeys = Object.entries(cfg.keys).filter(([, k]) => k.project === "fresh-proj");
+      assert.equal(newKeys.length, 1, "exactly one key labeled fresh-proj");
+      assert.equal(newKeys[0]![0], fresh[0]);
+      // existing keys + providers survived the write
+      assert.equal(cfg.keys[keyGeneric]?.project, "generic");
+      assert.equal(cfg.keys[keyAlpha]?.project, "alpha");
+      assert.ok(cfg.providers.ds, "providers preserved");
+      assert.deepEqual(cfg.routing.default, ["ds"], "routing preserved");
+      // write stays 0600 (it holds gateway keys)
+      const mode = statSync(cfgPath).mode & 0o777;
+      assert.equal(mode, 0o600, `config mode after mint: ${mode.toString(8)}`);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it("--project selects the existing matching key without duplicating (config untouched)", () => {
+    const dir = tmpDir();
+    try {
+      const { cfgPath, keyAlpha } = connectFixture(dir);
+      const before = readFileSync(cfgPath, "utf8");
+      const stdout = runConnect(["--config", cfgPath, "connect", "aider", "--project", "alpha"]);
+      assert.ok(!/minted/i.test(stdout), "nothing minted");
+      assert.ok(stdout.includes(keyAlpha), "selected key appears in the connect output");
+      assert.equal(readFileSync(cfgPath, "utf8"), before, "config bytes unchanged when selecting");
+      assert.equal(Object.keys(loadConfig(cfgPath).keys).length, 2, "no key duplicated");
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it("--project matching is case-sensitive: Alpha does not reuse alpha's key", () => {
+    const dir = tmpDir();
+    try {
+      const { cfgPath, keyAlpha } = connectFixture(dir);
+      const stdout = runConnect(["--config", cfgPath, "connect", "aider", "--project", "Alpha"]);
+      assert.match(stdout, /minted/i);
+      assert.ok(!stdout.includes(keyAlpha), "the differently-cased key was not selected");
+      const cfg = loadConfig(cfgPath);
+      const upper = Object.entries(cfg.keys).filter(([, k]) => k.project === "Alpha");
+      assert.equal(upper.length, 1, "new key minted for the exact-case label");
+      assert.equal(upper[0]![1].project, "Alpha");
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it("--project with no value defaults to basename(cwd)", () => {
+    const dir = tmpDir();
+    try {
+      const { cfgPath } = connectFixture(dir);
+      const repo = join(dir, "my-repo");
+      mkdirSync(repo, { recursive: true });
+      runConnect(["--config", cfgPath, "connect", "opencode", "--project"], { cwd: repo });
+      const cfg = loadConfig(cfgPath);
+      const labeled = Object.entries(cfg.keys).filter(([, k]) => k.project === "my-repo");
+      assert.equal(labeled.length, 1, "exactly one key bound to the cwd basename");
+      assert.match(labeled[0]![0], SKLG);
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it("no --project: legacy behavior byte-for-byte (first key in config order, config untouched)", () => {
+    const dir = tmpDir();
+    try {
+      const { cfgPath, keyGeneric, keyAlpha } = connectFixture(dir);
+      const before = readFileSync(cfgPath, "utf8");
+      const stdout = runConnect(["--config", cfgPath, "connect", "aider"]);
+      assert.ok(stdout.includes(keyGeneric), "legacy selection = first key in insertion order");
+      assert.ok(!stdout.includes(keyAlpha), "later keys are not selected");
+      assert.ok(!/minted/i.test(stdout) && !/using existing/i.test(stdout), "no new notices");
+      assert.equal(readFileSync(cfgPath, "utf8"), before, "config untouched");
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+
+  it("connect --project --write: merged opencode config carries the selected key", () => {
+    const dir = tmpDir();
+    try {
+      const { cfgPath, keyAlpha } = connectFixture(dir);
+      const xdg = join(dir, "xdg");
+      const stdout = runConnect(["--config", cfgPath, "connect", "opencode", "--write", "--project", "alpha"], {
+        env: { ...process.env, XDG_CONFIG_HOME: xdg },
+      });
+      assert.match(stdout, /merged provider block|created .* with the llm-gateway provider block/);
+      const merged = JSON.parse(readFileSync(join(xdg, "opencode", "opencode.json"), "utf8")) as {
+        provider: Record<string, { options: { apiKey: string; baseURL: string } }>;
+      };
+      const block = merged.provider["llm-gateway"];
+      assert.ok(block, "gateway block merged");
+      assert.equal(block.options.apiKey, keyAlpha, "selected (not first) key merged");
+      assert.match(block.options.baseURL, /http:\/\/127\.0\.0\.1:8090\/v1/);
+    } finally {
+      cleanupDir(dir);
     }
   });
 });

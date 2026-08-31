@@ -1,6 +1,7 @@
 /**
- * Node half of the `bin/gateway` shim: `connect` printers + `--write` merge,
- * and `gateway report` — the honest counterfactual-savings + work-delivered
+ * Node half of the `bin/gateway` shim: `connect` printers + `--write` merge
+ * (with `--project [name]` mint-or-select of a per-repo gateway key), and
+ * `gateway report` — the honest counterfactual-savings + work-delivered
  * receipt. The report reads the ledger DIRECTLY (no running gateway needed);
  * all savings math lives in src/report.ts (pure) over prices from
  * src/prices.ts. Process management (start/stop/status) stays in the bash
@@ -12,9 +13,10 @@
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { configPath, loadConfig, type GatewayConfig, type ProviderConfig } from "./config.ts";
 import { filterRecords, ledgerPath, readRecords } from "./ledger.ts";
+import { generateGatewayKey } from "./bootstrap.ts";
 import { PriceError, resolveReportPricing } from "./prices.ts";
 import { buildReport, type ReportOutput, type SplitBucket } from "./report.ts";
 
@@ -182,6 +184,81 @@ function connectInfoOf(cfg: GatewayConfig): ConnectInfo {
   const key = Object.keys(cfg.keys)[0];
   if (!key) throw new CliError(`config has no gateway keys — add one under "keys" first`);
   return { key, host: cfg.host, port: cfg.port, models: Object.keys(cfg.providers) };
+}
+
+// --- connect --project: mint-or-select a per-repo gateway key ---------------
+
+/** Parsed `gateway connect` flags. */
+export interface ConnectFlags {
+  tool?: string;
+  write: boolean;
+  /** --project appeared on the argv (the value may still be defaulted). */
+  projectRequested: boolean;
+  /** Explicit value after --project, when one was given. */
+  projectValue?: string;
+}
+
+/**
+ * Parse connect flags. Legacy rule preserved exactly: the FIRST bare argument
+ * is the tool, wherever it sits (`gateway connect --write opencode` selects
+ * "opencode" today and must keep doing so). `--project` takes an OPTIONAL
+ * value — a following flag (or end of argv) means "default it" (the caller
+ * uses basename(cwd)); a value is never mistaken for the tool name.
+ */
+export function parseConnectFlags(rest: readonly string[]): ConnectFlags {
+  const flags: ConnectFlags = { write: false, projectRequested: false };
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--write") flags.write = true;
+    else if (a === "--project") {
+      flags.projectRequested = true;
+      const v = rest[i + 1];
+      if (v !== undefined && !v.startsWith("--")) {
+        flags.projectValue = v;
+        i++;
+      }
+    } else if (!a.startsWith("--") && flags.tool === undefined) {
+      flags.tool = a;
+    }
+  }
+  return flags;
+}
+
+/**
+ * First existing gateway key (config insertion order) whose `project` matches
+ * exactly — case-sensitive — or null. Hashed (`sha256:<hex>`) keys match like
+ * any other; their id is what the config stores.
+ */
+export function findKeyForProject(cfg: GatewayConfig, project: string): string | null {
+  for (const [key, k] of Object.entries(cfg.keys)) {
+    if (k.project === project) return key;
+  }
+  return null;
+}
+
+/**
+ * Mint a 256-bit `sk-lg-` gateway key for `project` (same generator the
+ * installer uses) and append it to the config's `keys` map. The RAW JSON is
+ * re-read and mutated in place so every other field — including tolerated
+ * extras like `_readme` — survives; written back 0600 exactly like bootstrap
+ * (the file holds gateway keys); the result is re-validated with loadConfig,
+ * so config this touches can never drift out of schema.
+ */
+export function mintProjectKey(configFile: string, project: string): { key: string; cfg: GatewayConfig } {
+  const key = generateGatewayKey();
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(configFile, "utf8"));
+  } catch (e) {
+    throw new CliError(`cannot read ${configFile}: ${(e as Error).message}`);
+  }
+  const isObj = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+  if (!isObj(raw)) throw new CliError(`config ${configFile} is not a JSON object`);
+  if (!isObj(raw.keys)) throw new CliError(`config ${configFile} has no "keys" object to extend`);
+  raw.keys[key] = { project };
+  writeFileSync(configFile, JSON.stringify(raw, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  return { key, cfg: loadConfig(configFile) }; // re-validate: same rules as the server
 }
 
 // --- gateway report: honest counterfactual savings + work delivered --------
@@ -503,14 +580,37 @@ export async function runCli(argv: readonly string[]): Promise<void> {
   const [cmd, ...rest] = dispatch;
   switch (cmd) {
     case "connect": {
-      const write = rest.includes("--write");
-      const tool = rest.find((a) => !a.startsWith("--"));
-      if (!tool) {
-        throw new CliError("usage: gateway connect <opencode|aider|claude-code> [--write]");
+      const flags = parseConnectFlags(rest);
+      if (!flags.tool) {
+        throw new CliError("usage: gateway connect <opencode|aider|claude-code> [--write] [--project [name]]");
       }
       const cfg = loadInstalledConfig(argv);
-      const info = connectInfoOf(cfg);
-      if (tool === "opencode" && write) {
+      let info: ConnectInfo;
+      if (flags.projectRequested) {
+        // --project [name]: select the existing key for this project, or mint
+        // one; default label is the current directory's basename
+        const project = flags.projectValue ?? basename(process.cwd());
+        const existing = findKeyForProject(cfg, project);
+        if (existing !== null) {
+          console.log(`[connect] using existing gateway key for project "${project}"`);
+          info = { key: existing, host: cfg.host, port: cfg.port, models: Object.keys(cfg.providers) };
+        } else {
+          const configFile = resolveConfigPath(argv);
+          const minted = mintProjectKey(configFile, project);
+          console.log(`[connect] minted a new gateway key for project "${project}" (added to ${configFile})`);
+          console.log(`[connect] gateway key: ${minted.key}`);
+          console.log("[connect] keep it secret — it authorizes requests");
+          info = {
+            key: minted.key,
+            host: minted.cfg.host,
+            port: minted.cfg.port,
+            models: Object.keys(minted.cfg.providers),
+          };
+        }
+      } else {
+        info = connectInfoOf(cfg); // legacy selection: first key, untouched
+      }
+      if (flags.tool === "opencode" && flags.write) {
         const target = opencodeConfigPath();
         const { backupPath } = applyOpencodeMerge(target, info);
         console.log(
@@ -520,7 +620,7 @@ export async function runCli(argv: readonly string[]): Promise<void> {
         );
         console.log("[connect] restart opencode to pick it up");
       } else {
-        console.log(connectInstructions(tool, info));
+        console.log(connectInstructions(flags.tool, info));
       }
       return;
     }

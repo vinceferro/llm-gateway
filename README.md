@@ -41,7 +41,22 @@ Then connect a tool and read the receipts:
 
 ```bash
 gateway connect opencode     # or: aider, claude-code; --write merges the provider block
+gateway connect opencode --project   # per-repo key: usage + budget caps bind to this repo
 gateway report               # month-to-date receipt, straight from the ledger
+```
+
+Sample `gateway report` receipt (synthetic numbers — yours come from your ledger):
+
+```text
+gateway report — 2026-08 · project: * (all projects)
+project  requests  in tok  out tok  actual  cfA no-cache  cfB baseline  savings vs B
+-------  --------  ------  -------  ------  ------------  ------------  ------------
+myrepo         12  18,400    9,210   $1.24        $11.20        $14.90        $13.66
+sandbox         3   2,150    1,004   $0.08         $0.44         $0.59         $0.51
+TOTALS         15  20,550   10,214   $1.32        $11.64        $15.49        $14.17
+-------  --------  ------  -------  ------  ------------  ------------  ------------
+  routing/cache savings (cfB − cfA):        $3.85
+  total savings vs baseline (cfB − actual): $14.17
 ```
 
 Provider API keys live only in `~/.llm-gateway/env` as `export NAME=value`
