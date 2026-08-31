@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { ProviderConfig } from "../src/config.ts";
-import type { UsageRecord } from "../src/ledger.ts";
+import { filterRecords, type UsageRecord } from "../src/ledger.ts";
 import { resolveReportPricing } from "../src/prices.ts";
 import { buildReport, type ReportInput } from "../src/report.ts";
 
@@ -297,6 +297,64 @@ describe("per-project table", () => {
     assert.equal(only.cf_b_usd, null);
     assert.equal(only.savings_vs_baseline_usd, null);
     assert.equal(r.counterfactual.scope_requests, 0);
+  });
+});
+
+describe("daily buckets", () => {
+  it("one entry per day that has rows, sorted ascending, with per-day sums (off-month row filtered out by the caller)", () => {
+    // ReportInput.rows arrive ALREADY month/project-filtered (filterRecords) —
+    // same contract as the CLI + /admin/report handlers.
+    const seeded: UsageRecord[] = [
+      rec({ ts: "2026-08-02T12:00:00.000Z", usd: 0.5, input_tokens: 2 * M, output_tokens: 3 * M }),
+      rec({ ts: "2026-08-31T23:59:59.999Z", usd: 0.25 }),
+      rec({ ts: "2026-08-02T18:00:00.000Z", usd: 0.125 }),
+      rec({ ts: "2026-08-01T00:30:00.000Z", usd: 0.3 }), // UTC month boundary → day 1
+      rec({ ts: "2026-07-31T23:00:00.000Z", usd: 99 }), // other month → filtered out
+    ];
+    const rows = filterRecords(seeded, { month: "2026-08" });
+    const r = buildReport(inputOf(rows, { month: "2026-08" }));
+    assert.deepEqual(
+      r.daily.map((d) => d.day),
+      [1, 2, 31],
+      "one entry per day-with-rows, ascending; July row absent (no zero-fill, no off-month leak)",
+    );
+    const d1 = r.daily[0]!;
+    const d2 = r.daily[1]!;
+    const d31 = r.daily[2]!;
+    // day 1: the single 00:30Z boundary row
+    assert.equal(d1.requests, 1);
+    assert.equal(d1.input_tokens, M);
+    assert.equal(d1.output_tokens, M);
+    approxUsd(d1.usd, 0.3);
+    // day 2: both rows aggregate into ONE entry
+    assert.equal(d2.requests, 2);
+    assert.equal(d2.input_tokens, 3 * M);
+    assert.equal(d2.output_tokens, 4 * M);
+    approxUsd(d2.usd, 0.5 + 0.125, "same-day rows sum usd");
+    // day 31: untouched defaults from rec()
+    assert.equal(d31.requests, 1);
+    assert.equal(d31.input_tokens, M);
+    assert.equal(d31.output_tokens, M);
+    approxUsd(d31.usd, 0.25);
+  });
+
+  it("day numbers derive from UTC, never the host's local timezone", () => {
+    // 23:30Z and next-day 00:30Z are the same local date in UTC-5 hosts —
+    // a local-date parse would collapse them into one bucket; UTC must not.
+    const rows = [
+      rec({ ts: "2026-08-15T23:30:00.000Z" }),
+      rec({ ts: "2026-08-16T00:30:00.000Z" }),
+    ];
+    const r = buildReport(inputOf(rows));
+    assert.deepEqual(
+      r.daily.map((d) => d.day),
+      [15, 16],
+    );
+  });
+
+  it("empty month → daily = []", () => {
+    const r = buildReport(inputOf([]));
+    assert.deepEqual(r.daily, []);
   });
 });
 

@@ -105,12 +105,23 @@ export interface Counterfactual {
   plan_notice: string | null;
 }
 
+export interface DailyBucket {
+  /** UTC day-of-month parsed from row ts */
+  day: number;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  usd: number;
+}
+
 export interface ReportOutput {
   month: string;
   project: string;
   total_rows: number;
   projects: ProjectRow[];
   totals: ProjectRow;
+  /** one entry per day that HAS rows (no zero-fill), ascending; trend charts */
+  daily: DailyBucket[];
   work: WorkDelivered;
   counterfactual: Counterfactual;
   baseline: ListPrice & { id: string };
@@ -170,6 +181,31 @@ function emptyProjectRow(project: string): ProjectRow {
     cf_b_usd: null,
     savings_vs_baseline_usd: null,
   };
+}
+
+/** UTC day-of-month buckets over ALL rows (trend charts). Days without rows
+ *  are absent (not zero-filled) — chart layers decide their own zero-fill. */
+function dailyBuckets(rows: readonly UsageRecord[]): DailyBucket[] {
+  const byDay = new Map<number, UsageRecord[]>();
+  for (const r of rows) {
+    const day = new Date(r.ts).getUTCDate();
+    const list = byDay.get(day) ?? [];
+    list.push(r);
+    byDay.set(day, list);
+  }
+  return [...byDay.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([day, list]) => {
+      let input_tokens = 0;
+      let output_tokens = 0;
+      let usd = 0;
+      for (const r of list) {
+        input_tokens += r.input_tokens;
+        output_tokens += r.output_tokens;
+        usd = round9(usd + r.usd);
+      }
+      return { day, requests: list.length, input_tokens, output_tokens, usd };
+    });
 }
 
 /** Usd display formatting lives in the render layer; this module stays numeric. */
@@ -377,6 +413,7 @@ export function buildReport(input: ReportInput): ReportOutput {
     total_rows: rows.length,
     projects,
     totals,
+    daily: dailyBuckets(rows),
     work,
     counterfactual,
     baseline: b,

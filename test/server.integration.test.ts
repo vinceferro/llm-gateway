@@ -772,6 +772,13 @@ describe("GET /admin/report", () => {
       assert.equal(body.projects.length, 2);
       assert.equal(body.totals.requests, 3);
       assert.equal(typeof body.counterfactual.total_savings_usd, "number");
+      // daily buckets (trend charts): one entry per day-with-rows, ascending,
+      // per-day sums; the 2020-01 off-month row must NOT leak in
+      assert.deepEqual(body.daily, [
+        { day: 10, requests: 1, input_tokens: M, output_tokens: M, usd: 0.9 },
+        { day: 11, requests: 1, input_tokens: M, output_tokens: M, usd: 0.1 },
+        { day: 12, requests: 1, input_tokens: M, output_tokens: M, usd: 1.5 },
+      ]);
       // … and EXACT equality with the pure engine over identical inputs
       assert.deepEqual(body, expectedReport(fx, "2026-08"));
 
